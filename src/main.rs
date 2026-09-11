@@ -45,6 +45,10 @@ struct Cli {
 enum Commands {
     /// Show session preview (used internally by fzf --preview)
     Preview { session_id: String },
+    /// List sessions in fzf input format (used internally by fzf reload)
+    List,
+    /// Delete a session: its history entries and its transcript
+    Delete { session_id: String },
     /// Print shell integration code for your shell
     Init {
         /// Shell name (zsh, bash, fish)
@@ -369,6 +373,40 @@ fn cmd_preview(session_id: &str, content: &str) {
     print!("{}", render_preview(&session));
 }
 
+fn cmd_list() {
+    for line in format_for_fzf(&build_sessions(parse_sessions(&read_history()))) {
+        println!("{line}");
+    }
+}
+
+/// Removes the session's history.jsonl lines and its transcript. The transcript
+/// is looked up by session id across every projects/ sub-directory instead of
+/// re-implementing Claude Code's project-path munging.
+fn cmd_delete(session_id: &str) {
+    let path = history_file();
+    let kept: String = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| {
+            serde_json::from_str::<HistoryEntry>(line)
+                .map(|e| e.session_id != session_id)
+                .unwrap_or(true)
+        })
+        .map(|line| format!("{line}\n"))
+        .collect();
+    let tmp = path.with_extension("jsonl.tmp");
+    if let Err(e) = std::fs::write(&tmp, &kept).and_then(|_| std::fs::rename(&tmp, &path)) {
+        eprintln!("Failed to update {}: {}", path.display(), e);
+        std::process::exit(1);
+    }
+
+    if let Ok(entries) = std::fs::read_dir(claude_config_dir().join("projects")) {
+        for entry in entries.flatten() {
+            let _ = std::fs::remove_file(entry.path().join(format!("{session_id}.jsonl")));
+        }
+    }
+}
+
 fn cmd_return() {
     if !is_clauhist_shell() {
         eprintln!("Not inside a clauhist sub-shell.");
@@ -418,6 +456,12 @@ fn cmd_browse(sessions: Vec<Session>, print_mode: bool, exe_path: &str) {
     let lines = format_for_fzf(&sessions);
     let fzf_input = lines.join("\n");
     let preview_cmd = format!("{} preview {{1}}", shell_quote(exe_path));
+    // `;` not `&&`: reload replaces the list with the command's output, so list
+    // must run even when delete fails — `&&` would blank the browser.
+    let delete_cmd = format!(
+        "{exe} delete {{1}}; {exe} list",
+        exe = shell_quote(exe_path)
+    );
 
     let fzf_args: Vec<String> = vec![
         "--delimiter=\t".to_string(),
@@ -426,7 +470,7 @@ fn cmd_browse(sessions: Vec<Session>, print_mode: bool, exe_path: &str) {
         "--preview-window=down:50%:wrap".to_string(),
         "--height=85%".to_string(),
         "--border=rounded".to_string(),
-        "--header=Claude Code History Browser  [Enter: resume  Ctrl-O: toggle preview  Ctrl-C: cancel]"
+        "--header=Claude Code History Browser  [Enter: resume  Ctrl-X: delete  Ctrl-O: toggle preview  Ctrl-C: cancel]"
             .to_string(),
         "--prompt=Search: ".to_string(),
         "--no-sort".to_string(),
@@ -435,6 +479,7 @@ fn cmd_browse(sessions: Vec<Session>, print_mode: bool, exe_path: &str) {
         // so it works everywhere.
         "--bind=ctrl-o:toggle-preview".to_string(),
         "--bind=ctrl-/:toggle-preview".to_string(),
+        format!("--bind=ctrl-x:reload({delete_cmd})"),
     ];
 
     let mut child = match Command::new("fzf")
@@ -540,6 +585,12 @@ fn main() {
         }
         Some(Commands::Preview { session_id }) => {
             cmd_preview(&session_id, &read_history());
+        }
+        Some(Commands::List) => {
+            cmd_list();
+        }
+        Some(Commands::Delete { session_id }) => {
+            cmd_delete(&session_id);
         }
         None => {
             let sessions = build_sessions(parse_sessions(&read_history()));
@@ -753,6 +804,73 @@ mod tests {
         }
 
         std::fs::remove_dir_all(fake_home).unwrap();
+    }
+
+    #[test]
+    fn delete_removes_history_entries_and_transcript_but_keeps_the_rest() {
+        let config_dir = unique_temp_path("config");
+        let doomed_project = config_dir.join("projects").join("-home-user-doomed");
+        let other_project = config_dir.join("projects").join("-home-user-other");
+        std::fs::create_dir_all(&doomed_project).unwrap();
+        std::fs::create_dir_all(&other_project).unwrap();
+        std::fs::write(doomed_project.join("doomed.jsonl"), "transcript").unwrap();
+        std::fs::write(other_project.join("kept.jsonl"), "transcript").unwrap();
+
+        let p = home_path("projects/a");
+        std::fs::write(
+            config_dir.join("history.jsonl"),
+            format!(
+                "{{\"sessionId\":\"doomed\",\"display\":\"one\",\"timestamp\":10,\"project\":\"{p}\"}}\n\
+                 not json\n\
+                 {{\"sessionId\":\"kept\",\"display\":\"two\",\"timestamp\":20,\"project\":\"{p}\"}}\n\
+                 {{\"sessionId\":\"doomed\",\"display\":\"three\",\"timestamp\":30,\"project\":\"{p}\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let output = std::process::Command::new(clauhist_bin())
+            .args(["delete", "doomed"])
+            .env("CLAUDE_CONFIG_DIR", &config_dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+
+        let history = std::fs::read_to_string(config_dir.join("history.jsonl")).unwrap();
+        assert!(!history.contains("doomed"));
+        assert!(history.contains("\"kept\""));
+        // Unparsable lines are not clauhist's to drop.
+        assert!(history.contains("not json"));
+
+        assert!(!doomed_project.join("doomed.jsonl").exists());
+        assert!(other_project.join("kept.jsonl").exists());
+
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[test]
+    fn list_prints_sessions_in_fzf_format() {
+        let config_dir = unique_temp_path("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let p = home_path("projects/a");
+        std::fs::write(
+            config_dir.join("history.jsonl"),
+            format!(
+                "{{\"sessionId\":\"alpha\",\"display\":\"hello\",\"timestamp\":10,\"project\":\"{p}\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let output = std::process::Command::new(clauhist_bin())
+            .args(["list"])
+            .env("CLAUDE_CONFIG_DIR", &config_dir)
+            .output()
+            .unwrap();
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.starts_with("alpha\t"), "got: {stdout:?}");
+        assert!(stdout.contains("hello"));
+
+        std::fs::remove_dir_all(config_dir).unwrap();
     }
 
     #[test]
