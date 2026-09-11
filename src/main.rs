@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -23,6 +23,64 @@ struct Session {
     first_ts: u64,
     last_ts: u64,
     messages: Vec<(u64, String)>, // (timestamp_ms, display)
+    color: Option<SessionColor>,
+}
+
+/// Color chosen with `/color`. Claude Code persists it as an `agent-color`
+/// record in the session transcript; the last record wins.
+#[derive(Debug, Clone, PartialEq)]
+struct SessionColor(String);
+
+impl SessionColor {
+    /// List marker in the terminal's closest color; unknown names keep the
+    /// default foreground.
+    fn marker(&self) -> String {
+        let code = match self.0.as_str() {
+            "red" => "31",
+            "green" => "32",
+            "yellow" => "33",
+            "blue" => "34",
+            "purple" => "35",
+            "cyan" => "36",
+            "orange" => "38;5;208",
+            "pink" => "38;5;213",
+            _ => "39",
+        };
+        format!("\x1b[{code}m●\x1b[0m")
+    }
+}
+
+#[derive(Deserialize)]
+struct ColorRecord {
+    #[serde(rename = "agentColor")]
+    agent_color: String,
+}
+
+/// Colors of the given sessions, read from their transcripts under projects/.
+/// Transcripts are large, so only lines with the record prefix are parsed.
+fn session_colors<'a>(session_ids: impl Iterator<Item = &'a str>) -> HashMap<String, SessionColor> {
+    const PREFIX: &[u8] = b"{\"type\":\"agent-color\"";
+    let ids: HashSet<&str> = session_ids.collect();
+    let mut colors = HashMap::new();
+    let Ok(dirs) = std::fs::read_dir(claude_config_dir().join("projects")) else {
+        return colors;
+    };
+    for dir in dirs.flatten() {
+        for id in &ids {
+            let Ok(bytes) = std::fs::read(dir.path().join(format!("{id}.jsonl"))) else {
+                continue;
+            };
+            let last = bytes
+                .split(|&b| b == b'\n')
+                .filter(|line| line.starts_with(PREFIX))
+                .filter_map(|line| serde_json::from_slice::<ColorRecord>(line).ok())
+                .last();
+            if let Some(record) = last {
+                colors.insert(id.to_string(), SessionColor(record.agent_color));
+            }
+        }
+    }
+    colors
 }
 
 #[derive(Parser)]
@@ -137,16 +195,32 @@ fn build_session(session_id: String, mut entries: Vec<HistoryEntry>) -> Session 
         first_ts,
         last_ts,
         messages,
+        color: None,
     }
 }
 
-fn build_sessions(raw: HashMap<String, Vec<HistoryEntry>>) -> Vec<Session> {
+fn build_sessions(
+    raw: HashMap<String, Vec<HistoryEntry>>,
+    mut colors: HashMap<String, SessionColor>,
+) -> Vec<Session> {
     let mut sessions: Vec<Session> = raw
         .into_iter()
-        .map(|(session_id, entries)| build_session(session_id, entries))
+        .map(|(session_id, entries)| {
+            let color = colors.remove(&session_id);
+            Session {
+                color,
+                ..build_session(session_id, entries)
+            }
+        })
         .collect();
     sessions.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
     sessions
+}
+
+fn load_sessions() -> Vec<Session> {
+    let raw = parse_sessions(&read_history());
+    let colors = session_colors(raw.keys().map(String::as_str));
+    build_sessions(raw, colors)
 }
 
 fn truncate(text: &str, max_chars: usize) -> String {
@@ -204,10 +278,16 @@ fn format_for_fzf(sessions: &[Session]) -> Vec<String> {
                 .first()
                 .map(|(_, msg)| truncate(&msg.replace(['\t', '\n'], " "), 70))
                 .unwrap_or_default();
+            let color = s
+                .color
+                .as_ref()
+                .map(SessionColor::marker)
+                .unwrap_or_else(|| " ".to_string());
             format!(
-                "{}\t{}\t{} {}\t{}\t({})",
+                "{}\t{}\t{} {} {}\t{}\t({})",
                 s.session_id,
                 date_str,
+                color,
                 exists,
                 s.project,
                 first_msg,
@@ -374,7 +454,7 @@ fn cmd_preview(session_id: &str, content: &str) {
 }
 
 fn cmd_list() {
-    for line in format_for_fzf(&build_sessions(parse_sessions(&read_history()))) {
+    for line in format_for_fzf(&load_sessions()) {
         println!("{line}");
     }
 }
@@ -466,6 +546,8 @@ fn cmd_browse(sessions: Vec<Session>, print_mode: bool, exe_path: &str) {
     let fzf_args: Vec<String> = vec![
         "--delimiter=\t".to_string(),
         "--with-nth=2,3,4,5".to_string(),
+        // The color marker is ANSI-colored; fzf strips the codes from its output.
+        "--ansi".to_string(),
         format!("--preview={}", preview_cmd),
         "--preview-window=down:50%:wrap".to_string(),
         "--height=85%".to_string(),
@@ -526,7 +608,7 @@ fn cmd_browse(sessions: Vec<Session>, print_mode: bool, exe_path: &str) {
     }
 
     let session_id = fields[0];
-    let project = fields[2].trim_start_matches(['✓', '✗', ' ']);
+    let project = fields[2].trim_start_matches(['●', '✓', '✗', ' ']);
 
     // The resume command is `cd <project> && claude --resume <id>`, so a missing
     // directory means claude never starts. Say so instead of failing silently.
@@ -593,7 +675,7 @@ fn main() {
             cmd_delete(&session_id);
         }
         None => {
-            let sessions = build_sessions(parse_sessions(&read_history()));
+            let sessions = load_sessions();
             if sessions.is_empty() {
                 let path = history_file();
                 if !path.exists() {
@@ -693,7 +775,7 @@ mod tests {
             )],
         );
 
-        let sessions = build_sessions(raw);
+        let sessions = build_sessions(raw, HashMap::new());
 
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].session_id, "newer");
@@ -739,7 +821,7 @@ mod tests {
              {{\"sessionId\":\"alpha\",\"display\":\"first\",\"timestamp\":10,\"project\":\"{p}\"}}\n"
         );
 
-        let all = build_sessions(parse_sessions(&raw));
+        let all = build_sessions(parse_sessions(&raw), HashMap::new());
         let from_full = all.iter().find(|s| s.session_id == "alpha").unwrap();
         let targeted = build_session("alpha".to_string(), parse_session_entries(&raw, "alpha"));
 
@@ -874,6 +956,56 @@ mod tests {
     }
 
     #[test]
+    fn session_colors_takes_the_last_record_of_listed_sessions_only() {
+        let config_dir = unique_temp_path("config");
+        let project_dir = config_dir.join("projects").join("-home-me-app");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("alpha.jsonl"),
+            concat!(
+                "{\"type\":\"agent-color\",\"agentColor\":\"red\",\"sessionId\":\"alpha\"}\n",
+                "{\"type\":\"user\",\"message\":{\"content\":\"/color blue\"}}\n",
+                "{\"type\":\"agent-color\",\"agentColor\":\"blue\",\"sessionId\":\"alpha\"}\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            project_dir.join("beta.jsonl"),
+            "{\"type\":\"agent-color\",\"agentColor\":\"pink\",\"sessionId\":\"beta\"}\n",
+        )
+        .unwrap();
+        std::fs::write(project_dir.join("gamma.jsonl"), "{\"type\":\"user\"}\n").unwrap();
+
+        std::env::set_var("CLAUDE_CONFIG_DIR", &config_dir);
+        let colors = session_colors(["alpha", "gamma", "missing"].into_iter());
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        assert_eq!(colors.get("alpha"), Some(&SessionColor("blue".to_string())));
+        assert_eq!(colors.get("beta"), None);
+        assert_eq!(colors.get("gamma"), None);
+        assert_eq!(colors.len(), 1);
+
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[test]
+    fn format_for_fzf_shows_a_colored_marker() {
+        let session = Session {
+            session_id: "session-1".to_string(),
+            project: home_path("projects/x"),
+            first_ts: 0,
+            last_ts: 0,
+            messages: vec![],
+            color: Some(SessionColor("orange".to_string())),
+        };
+
+        let lines = format_for_fzf(&[session]);
+        let fields: Vec<&str> = lines[0].split('\t').collect();
+
+        assert!(fields[2].starts_with("\x1b[38;5;208m●\x1b[0m ✗ "), "got: {:?}", fields[2]);
+    }
+
+    #[test]
     fn truncate_respects_character_boundaries() {
         assert_eq!(truncate("こんにちは世界", 4), "こんにち…");
         assert_eq!(truncate("rust", 4), "rust");
@@ -897,13 +1029,14 @@ mod tests {
             first_ts: 0,
             last_ts: 0,
             messages: vec![(0, "hello\tworld\nagain".to_string())],
+            color: None,
         };
 
         let lines = format_for_fzf(&[session]);
         let fields: Vec<&str> = lines[0].split('\t').collect();
 
         assert_eq!(fields[0], "session-1");
-        assert!(fields[2].starts_with(&format!("✓ {}", existing_dir.display())));
+        assert!(fields[2].starts_with(&format!("  ✓ {}", existing_dir.display())));
         assert_eq!(fields[3], "hello world again");
         assert_eq!(fields[4], "(1)");
 
@@ -1226,6 +1359,7 @@ mod tests {
             first_ts: invalid_ms,
             last_ts: invalid_ms,
             messages: vec![(invalid_ms, "line one\nline two".to_string())],
+            color: None,
         });
 
         assert!(preview.contains(&format!("Project : {p}")));

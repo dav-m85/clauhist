@@ -7,9 +7,9 @@ Browse Claude Code history across working directories and resume sessions.
 │ Claude Code History Browser  [Enter: resume  Ctrl-X: delete  Ctrl-O: toggle preview  Ctrl-C: cancel] │
 ├──────────────────────────────────────────────────────────────────────────────────────────────────────┤
 │ Search:                                                                                              │
-│ > 2026-03-18 09:12  ✓ ~/projects/myapp      Tell me about Rust error handling…  (12)                 │
-│   2026-03-17 22:45  ✓ ~/sandbox/api-client  Generate client from OpenAPI schema  (8)                 │
-│   2026-03-17 14:30  ✗ ~/old-project         Database migration steps             (3)                 │
+│ > 2026-03-18 09:12  ● ✓ ~/projects/myapp      Tell me about Rust error handling…  (12)               │
+│   2026-03-17 22:45    ✓ ~/sandbox/api-client  Generate client from OpenAPI schema  (8)               │
+│   2026-03-17 14:30  ● ✗ ~/old-project         Database migration steps             (3)               │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 *(Example output — actual appearance depends on your terminal and fzf version)*
@@ -90,10 +90,11 @@ The fzf browser opens with your Claude Code sessions sorted by most recent activ
 ### Reading the list
 
 ```
-2026-03-18 09:12  ✓ ~/projects/myapp  First message preview…  (12)
-│                 │                                             └── message count
-│                 └── ✓ project directory exists
-│                     ✗ directory not found (deleted or moved)
+2026-03-18 09:12  ● ✓ ~/projects/myapp  First message preview…  (12)
+│                 │ │                                             └── message count
+│                 │ └── ✓ project directory exists
+│                 │     ✗ directory not found (deleted or moved)
+│                 └── session color, if one was set with `/color`
 └── last activity timestamp
 ```
 
