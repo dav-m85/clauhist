@@ -24,6 +24,17 @@ struct Session {
     last_ts: u64,
     messages: Vec<(u64, String)>, // (timestamp_ms, display)
     color: Option<SessionColor>,
+    /// Name given with `/rename`.
+    title: Option<String>,
+}
+
+impl Session {
+    /// One-line label: the `/rename` title, else the first prompt.
+    fn label(&self) -> Option<&str> {
+        self.title
+            .as_deref()
+            .or_else(|| self.messages.first().map(|(_, msg)| msg.as_str()))
+    }
 }
 
 /// Color chosen with `/color`. Claude Code persists it as an `agent-color`
@@ -50,37 +61,60 @@ impl SessionColor {
     }
 }
 
-#[derive(Deserialize)]
-struct ColorRecord {
-    #[serde(rename = "agentColor")]
-    agent_color: String,
+/// Per-session records Claude Code appends to the transcript on `/color` and
+/// `/rename`; the last record of each kind wins.
+#[derive(Debug, Default, PartialEq)]
+struct SessionMeta {
+    color: Option<SessionColor>,
+    title: Option<String>,
 }
 
-/// Colors of the given sessions, read from their transcripts under projects/.
-/// Transcripts are large, so only lines with the record prefix are parsed.
-fn session_colors<'a>(session_ids: impl Iterator<Item = &'a str>) -> HashMap<String, SessionColor> {
-    const PREFIX: &[u8] = b"{\"type\":\"agent-color\"";
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum MetaRecord {
+    #[serde(rename = "agent-color")]
+    Color {
+        #[serde(rename = "agentColor")]
+        agent_color: String,
+    },
+    #[serde(rename = "custom-title")]
+    Title {
+        #[serde(rename = "customTitle")]
+        custom_title: String,
+    },
+}
+
+/// Metadata of the given sessions, read from their transcripts under projects/.
+/// Transcripts are large, so only lines with a known record prefix are parsed.
+fn session_metadata<'a>(session_ids: impl Iterator<Item = &'a str>) -> HashMap<String, SessionMeta> {
+    const PREFIXES: [&[u8]; 2] = [b"{\"type\":\"agent-color\"", b"{\"type\":\"custom-title\""];
     let ids: HashSet<&str> = session_ids.collect();
-    let mut colors = HashMap::new();
+    let mut metas = HashMap::new();
     let Ok(dirs) = std::fs::read_dir(claude_config_dir().join("projects")) else {
-        return colors;
+        return metas;
     };
     for dir in dirs.flatten() {
         for id in &ids {
             let Ok(bytes) = std::fs::read(dir.path().join(format!("{id}.jsonl"))) else {
                 continue;
             };
-            let last = bytes
+            let mut meta = SessionMeta::default();
+            let records = bytes
                 .split(|&b| b == b'\n')
-                .filter(|line| line.starts_with(PREFIX))
-                .filter_map(|line| serde_json::from_slice::<ColorRecord>(line).ok())
-                .last();
-            if let Some(record) = last {
-                colors.insert(id.to_string(), SessionColor(record.agent_color));
+                .filter(|line| PREFIXES.iter().any(|p| line.starts_with(p)))
+                .filter_map(|line| serde_json::from_slice::<MetaRecord>(line).ok());
+            for record in records {
+                match record {
+                    MetaRecord::Color { agent_color } => meta.color = Some(SessionColor(agent_color)),
+                    MetaRecord::Title { custom_title } => meta.title = Some(custom_title),
+                }
+            }
+            if meta != SessionMeta::default() {
+                metas.insert(id.to_string(), meta);
             }
         }
     }
-    colors
+    metas
 }
 
 #[derive(Parser)]
@@ -196,19 +230,21 @@ fn build_session(session_id: String, mut entries: Vec<HistoryEntry>) -> Session 
         last_ts,
         messages,
         color: None,
+        title: None,
     }
 }
 
 fn build_sessions(
     raw: HashMap<String, Vec<HistoryEntry>>,
-    mut colors: HashMap<String, SessionColor>,
+    mut metas: HashMap<String, SessionMeta>,
 ) -> Vec<Session> {
     let mut sessions: Vec<Session> = raw
         .into_iter()
         .map(|(session_id, entries)| {
-            let color = colors.remove(&session_id);
+            let meta = metas.remove(&session_id).unwrap_or_default();
             Session {
-                color,
+                color: meta.color,
+                title: meta.title,
                 ..build_session(session_id, entries)
             }
         })
@@ -219,8 +255,8 @@ fn build_sessions(
 
 fn load_sessions() -> Vec<Session> {
     let raw = parse_sessions(&read_history());
-    let colors = session_colors(raw.keys().map(String::as_str));
-    build_sessions(raw, colors)
+    let metas = session_metadata(raw.keys().map(String::as_str));
+    build_sessions(raw, metas)
 }
 
 fn truncate(text: &str, max_chars: usize) -> String {
@@ -273,10 +309,9 @@ fn format_for_fzf(sessions: &[Session]) -> Vec<String> {
             } else {
                 "✗"
             };
-            let first_msg = s
-                .messages
-                .first()
-                .map(|(_, msg)| truncate(&msg.replace(['\t', '\n'], " "), 70))
+            let label = s
+                .label()
+                .map(|msg| truncate(&msg.replace(['\t', '\n'], " "), 70))
                 .unwrap_or_default();
             let color = s
                 .color
@@ -290,7 +325,7 @@ fn format_for_fzf(sessions: &[Session]) -> Vec<String> {
                 color,
                 exists,
                 s.project,
-                first_msg,
+                label,
                 s.messages.len()
             )
         })
@@ -298,7 +333,11 @@ fn format_for_fzf(sessions: &[Session]) -> Vec<String> {
 }
 
 fn render_preview(session: &Session) -> String {
-    let mut output = format!(
+    let mut output = String::new();
+    if let Some(title) = &session.title {
+        output.push_str(&format!("Title   : {title}\n"));
+    }
+    output.push_str(&format!(
         "Project : {}\nSession : {}\nStarted : {}\nLast    : {}\nMessages: {}\n{}\n",
         session.project,
         session.session_id,
@@ -306,7 +345,7 @@ fn render_preview(session: &Session) -> String {
         format_ts_datetime(session.last_ts),
         session.messages.len(),
         "─".repeat(60)
-    );
+    ));
 
     for (ts, msg) in &session.messages {
         let clean = msg.replace('\n', " ");
@@ -449,7 +488,14 @@ fn cmd_preview(session_id: &str, content: &str) {
         println!("Session not found: {}", session_id);
         return;
     }
-    let session = build_session(session_id.to_string(), entries);
+    let meta = session_metadata(std::iter::once(session_id))
+        .remove(session_id)
+        .unwrap_or_default();
+    let session = Session {
+        color: meta.color,
+        title: meta.title,
+        ..build_session(session_id.to_string(), entries)
+    };
     print!("{}", render_preview(&session));
 }
 
@@ -956,7 +1002,7 @@ mod tests {
     }
 
     #[test]
-    fn session_colors_takes_the_last_record_of_listed_sessions_only() {
+    fn session_metadata_takes_the_last_record_of_listed_sessions_only() {
         let config_dir = unique_temp_path("config");
         let project_dir = config_dir.join("projects").join("-home-me-app");
         std::fs::create_dir_all(&project_dir).unwrap();
@@ -966,6 +1012,8 @@ mod tests {
                 "{\"type\":\"agent-color\",\"agentColor\":\"red\",\"sessionId\":\"alpha\"}\n",
                 "{\"type\":\"user\",\"message\":{\"content\":\"/color blue\"}}\n",
                 "{\"type\":\"agent-color\",\"agentColor\":\"blue\",\"sessionId\":\"alpha\"}\n",
+                "{\"type\":\"custom-title\",\"customTitle\":\"old\",\"sessionId\":\"alpha\"}\n",
+                "{\"type\":\"custom-title\",\"customTitle\":\"renamed\",\"sessionId\":\"alpha\"}\n",
             ),
         )
         .unwrap();
@@ -974,18 +1022,64 @@ mod tests {
             "{\"type\":\"agent-color\",\"agentColor\":\"pink\",\"sessionId\":\"beta\"}\n",
         )
         .unwrap();
+        std::fs::write(
+            project_dir.join("delta.jsonl"),
+            "{\"type\":\"custom-title\",\"customTitle\":\"only-title\",\"sessionId\":\"delta\"}\n",
+        )
+        .unwrap();
         std::fs::write(project_dir.join("gamma.jsonl"), "{\"type\":\"user\"}\n").unwrap();
 
         std::env::set_var("CLAUDE_CONFIG_DIR", &config_dir);
-        let colors = session_colors(["alpha", "gamma", "missing"].into_iter());
+        let metas = session_metadata(["alpha", "delta", "gamma", "missing"].into_iter());
         std::env::remove_var("CLAUDE_CONFIG_DIR");
 
-        assert_eq!(colors.get("alpha"), Some(&SessionColor("blue".to_string())));
-        assert_eq!(colors.get("beta"), None);
-        assert_eq!(colors.get("gamma"), None);
-        assert_eq!(colors.len(), 1);
+        assert_eq!(
+            metas.get("alpha"),
+            Some(&SessionMeta {
+                color: Some(SessionColor("blue".to_string())),
+                title: Some("renamed".to_string()),
+            })
+        );
+        assert_eq!(
+            metas.get("delta"),
+            Some(&SessionMeta {
+                color: None,
+                title: Some("only-title".to_string()),
+            })
+        );
+        assert_eq!(metas.get("beta"), None);
+        assert_eq!(metas.get("gamma"), None);
+        assert_eq!(metas.len(), 2);
 
         std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[test]
+    fn label_prefers_title_over_first_message() {
+        let session = Session {
+            session_id: "session-1".to_string(),
+            project: home_path("projects/x"),
+            first_ts: 0,
+            last_ts: 0,
+            messages: vec![(0, "first prompt".to_string())],
+            color: None,
+            title: Some("my title".to_string()),
+        };
+
+        let lines = format_for_fzf(&[session]);
+        let fields: Vec<&str> = lines[0].split('\t').collect();
+        assert_eq!(fields[3], "my title");
+
+        let session = Session {
+            session_id: "session-1".to_string(),
+            project: home_path("projects/x"),
+            first_ts: 0,
+            last_ts: 0,
+            messages: vec![(0, "first prompt".to_string())],
+            color: None,
+            title: Some("my title".to_string()),
+        };
+        assert!(render_preview(&session).starts_with("Title   : my title\n"));
     }
 
     #[test]
@@ -997,6 +1091,7 @@ mod tests {
             last_ts: 0,
             messages: vec![],
             color: Some(SessionColor("orange".to_string())),
+            title: None,
         };
 
         let lines = format_for_fzf(&[session]);
@@ -1030,6 +1125,7 @@ mod tests {
             last_ts: 0,
             messages: vec![(0, "hello\tworld\nagain".to_string())],
             color: None,
+            title: None,
         };
 
         let lines = format_for_fzf(&[session]);
@@ -1360,6 +1456,7 @@ mod tests {
             last_ts: invalid_ms,
             messages: vec![(invalid_ms, "line one\nline two".to_string())],
             color: None,
+            title: None,
         });
 
         assert!(preview.contains(&format!("Project : {p}")));
